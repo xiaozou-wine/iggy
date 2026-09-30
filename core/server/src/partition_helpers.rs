@@ -77,10 +77,12 @@ use tracing::error;
 ///
 /// [`ServerError::PartitionSuperblockIo`] when the directory or a slot
 /// cannot be read; the `VersionUnknown` / `Unverifiable` / `Undecodable` /
-/// `IdentityMismatch` variants when a record exists but cannot be trusted.
+/// `IdentityMismatch` / `PartitionViewBelowCreation` variants when a record
+/// exists but cannot be trusted.
 pub async fn open_partition_superblock(
     partition_dir: &str,
     identity: ReplicaIdentity,
+    created_view: u32,
 ) -> Result<(Rc<PingPongSuperblock>, Option<VsrState>), ServerError> {
     let io_error = |source| ServerError::PartitionSuperblockIo {
         dir: PathBuf::from(partition_dir),
@@ -142,6 +144,14 @@ pub async fn open_partition_superblock(
                 identity.replica_count.into(),
                 state.replica_count.into(),
             );
+        }
+        if state.log_view != 0 && state.log_view < created_view {
+            return Err(ServerError::PartitionViewBelowCreation {
+                dir: PathBuf::from(partition_dir),
+                view: state.view,
+                log_view: state.log_view,
+                created_view,
+            });
         }
     }
     Ok((Rc::new(superblock), recovered_state))
@@ -365,7 +375,9 @@ pub async fn load_partition_or_fence(
             | ServerError::PartitionSuperblockVersionUnknown { .. }
             | ServerError::PartitionSuperblockUnverifiable { .. }
             | ServerError::PartitionSuperblockUndecodable { .. }
-            | ServerError::PartitionSuperblockIdentityMismatch { .. }),
+            | ServerError::PartitionSuperblockIdentityMismatch { .. }
+            | ServerError::PartitionViewBelowCreation { .. }
+            | ServerError::PartitionWalViewBelowCreation { .. }),
         ) => {
             error!(
                 stream_id,
@@ -410,6 +422,7 @@ async fn load_partition(
             replica_id: self_replica_id,
             replica_count,
         },
+        partition_metadata.created_view,
     )
     .await?;
 
@@ -446,7 +459,7 @@ async fn load_partition(
             durable_view: recovered_state
                 .as_ref()
                 .map(|state| (state.view, state.log_view)),
-            view_fallback: None,
+            view_fallback: Some(partition_metadata.created_view),
             seed_view: None,
             incarnation: None,
             join,
@@ -467,34 +480,46 @@ async fn load_partition(
     {
         let directory = Path::new(&partition_dir)
             .join(format!("prepares-{}", partition_metadata.created_revision));
-        Some(
-            PartitionPersistence::open_with_capacity(
-                &directory,
-                namespace.inner(),
-                partition_metadata.created_revision,
-                DiskStorage,
-                config.partition.wal_bytes_max.as_bytes_u64(),
-                runtime_options
-                    .preallocate_segments
-                    .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
-            )
-            .await
-            .map_err(|source| match source.kind() {
-                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
-                    ServerError::PartitionRecovery(PartitionRecoveryError::Refused {
-                        dir: PathBuf::from(&partition_dir),
-                        stream_id: namespace.stream_id(),
-                        topic_id: namespace.topic_id(),
-                        partition_id: namespace.partition_id(),
-                        reason: PartitionRecoveryRefusal::PrepareWal { directory, source },
-                    })
-                }
-                _ => ServerError::PartitionPrepareWalIo {
-                    dir: directory,
-                    source,
-                },
-            })?,
+        let (persistence, prepares) = PartitionPersistence::open_with_capacity(
+            &directory,
+            namespace.inner(),
+            partition_metadata.created_revision,
+            DiskStorage,
+            config.partition.wal_bytes_max.as_bytes_u64(),
+            runtime_options
+                .preallocate_segments
+                .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS),
         )
+        .await
+        .map_err(|source| match source.kind() {
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof => {
+                ServerError::PartitionRecovery(PartitionRecoveryError::Refused {
+                    dir: PathBuf::from(&partition_dir),
+                    stream_id: namespace.stream_id(),
+                    topic_id: namespace.topic_id(),
+                    partition_id: namespace.partition_id(),
+                    reason: PartitionRecoveryRefusal::PrepareWal {
+                        directory: directory.clone(),
+                        source,
+                    },
+                })
+            }
+            _ => ServerError::PartitionPrepareWalIo {
+                dir: directory.clone(),
+                source,
+            },
+        })?;
+        if let Some(log_view) = persistence.certified_log_view()
+            && log_view != 0
+            && log_view < partition_metadata.created_view
+        {
+            return Err(ServerError::PartitionWalViewBelowCreation {
+                dir: directory,
+                log_view,
+                created_view: partition_metadata.created_view,
+            });
+        }
+        Some((persistence, prepares))
     } else {
         None
     };
@@ -717,7 +742,8 @@ async fn recover_partition_segments(
 /// in: the metadata plane's view when it committed the create, recorded on
 /// the committed partition so every replica seeds the same value. See the
 /// `seed_view` comment below for why a group left at view 0 is unreachable. A
-/// restart materialization ignores it and probes for the live view instead.
+/// restart keeps it as a view floor while probing for the live view, without
+/// assigning it to the recovered log.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and its
 /// `OffsetSpace` is unused, mirroring a clean append starting at the empty
@@ -749,8 +775,8 @@ pub async fn build_partition_fresh(
     // is the marker of a prior life (the .log inside may legitimately be
     // empty -- committed-but-unflushed data dies with the journal), while a
     // genuinely fresh create finds nothing.
-    let restarted = replica_count > 1
-        && std::fs::metadata(config.get_partition_path(stream_id, topic_id, partition_id)).is_ok();
+    let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
+    let restarted = replica_count > 1 && std::fs::metadata(&partition_dir).is_ok();
     create_partition_file_hierarchy(stream_id, topic_id, partition_id, partitions_config)
         .await
         .map_err(|source| {
@@ -767,18 +793,13 @@ pub async fn build_partition_fresh(
     if runtime_options.durability.is_persisted()
         || runtime_options.consumer_offset_durability.is_persisted()
     {
-        persist_partition_hierarchy(
-            &config.get_partition_path(stream_id, topic_id, partition_id),
-            &config.get_system_path(),
-        )
-        .await?;
+        persist_partition_hierarchy(&partition_dir, &config.get_system_path()).await?;
     }
 
     // The hierarchy create above guarantees the directory exists; recover this
     // group's durable (view, log_view) before choosing how to join, so a
     // restart materialization resumes from the view it last recorded instead
     // of re-entering an older one.
-    let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
     let (superblock, recovered_state) = open_partition_superblock(
         &partition_dir,
         ReplicaIdentity {
@@ -786,6 +807,7 @@ pub async fn build_partition_fresh(
             replica_id: self_replica_id,
             replica_count,
         },
+        created_view,
     )
     .await?;
 
@@ -806,8 +828,11 @@ pub async fn build_partition_fresh(
         .map(|state| (state.view, state.log_view));
     // Shared with the simulator's `init_partition`, which cannot call this
     // builder; see `fresh_group_start`.
-    let FreshGroupStart { join, seed_view } =
-        fresh_group_start(restarted, durable_view, created_view);
+    let FreshGroupStart {
+        view_fallback,
+        seed_view,
+        join,
+    } = fresh_group_start(restarted, durable_view, created_view);
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
@@ -822,7 +847,7 @@ pub async fn build_partition_fresh(
         VsrRestore {
             timers: &timers,
             durable_view,
-            view_fallback: None,
+            view_fallback,
             // Both planes pick their primary as `view % replica_count` from
             // their OWN view counter. A group left at view 0 while the
             // metadata plane sits elsewhere therefore names a different node
@@ -1000,6 +1025,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use configs::server::ServerConfig;
+    use consensus::Sequencer;
     use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
     use iggy_binary_protocol::{Command, Operation, PrepareHeader};
     use journal::DurableAppend;
@@ -1014,6 +1040,348 @@ mod tests {
     const CLUSTER: u128 = 7;
     const REPLICA: u8 = 1;
     const REPLICAS: u8 = 3;
+
+    #[compio::test]
+    async fn given_uncertified_view_when_loading_or_rebuilding_should_persist_creation_floor() {
+        const CREATED_VIEW: u32 = 2;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for (use_loader, old_view) in [
+            (true, None),
+            (false, None),
+            (true, Some(CREATED_VIEW - 1)),
+            (false, Some(CREATED_VIEW - 1)),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            let directory = config.get_partition_path(1, 1, 0);
+            let partitions_config = solo_partitions_config(&config);
+            let fresh = build_partition_fresh(
+                &config,
+                &partitions_config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                0,
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                CREATED_VIEW,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(fresh.consensus().view(), CREATED_VIEW);
+            assert!(fresh.consensus().needs_superblock_persist());
+            drop(fresh);
+
+            if let Some(view) = old_view {
+                let (store, _) = open_partition_superblock(&directory, test_identity(), 0)
+                    .await
+                    .unwrap();
+                let state = VsrState {
+                    commit_max: 0,
+                    ..recorded_state(view, 0)
+                };
+                store.write(&state.to_bytes()).await.unwrap();
+            }
+
+            let recovered = if use_loader {
+                load_partition(
+                    &config,
+                    &partitions_config,
+                    namespace,
+                    Arc::new(PartitionStats::default()),
+                    &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, CREATED_VIEW),
+                    TopicRuntimeOptions::default(),
+                    CLUSTER,
+                    REPLICA,
+                    REPLICAS,
+                    Rc::new(IggyMessageBus::new(0)),
+                )
+                .await
+            } else {
+                build_partition_fresh(
+                    &config,
+                    &partitions_config,
+                    namespace,
+                    Arc::new(PartitionStats::default()),
+                    0,
+                    TopicRuntimeOptions::default(),
+                    CLUSTER,
+                    REPLICA,
+                    REPLICAS,
+                    CREATED_VIEW,
+                    Rc::new(IggyMessageBus::new(0)),
+                )
+                .await
+            }
+            .unwrap();
+            assert_eq!(
+                recovered.consensus().status(),
+                consensus::Status::Recovering
+            );
+            assert_eq!(
+                recovered.consensus().log_view(),
+                0,
+                "creation metadata must not certify the recovered log"
+            );
+            assert!(recovered.consensus().needs_superblock_persist());
+            assert_eq!(recovered.consensus().view(), CREATED_VIEW);
+            assert!(recovered.persist_superblock_if_needed().await);
+            assert!(!recovered.consensus().needs_superblock_persist());
+            drop(recovered);
+            let (_, recorded) =
+                open_partition_superblock(&directory, test_identity(), CREATED_VIEW)
+                    .await
+                    .unwrap();
+            let recorded = recorded.unwrap();
+            assert_eq!(recorded.view, CREATED_VIEW);
+            assert_eq!(recorded.log_view, 0);
+        }
+    }
+
+    #[compio::test]
+    async fn given_durable_state_below_creation_view_when_loading_should_refuse_unchanged() {
+        const CREATED_VIEW: u32 = 2;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        for state in [recorded_state(1, 1), recorded_state(3, 1)] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            let directory = config.get_partition_path(1, 1, 0);
+            let (store, _) = open_partition_superblock(&directory, test_identity(), 0)
+                .await
+                .unwrap();
+            store.write(&state.to_bytes()).await.unwrap();
+            drop(store);
+            let partitions = solo_partitions(&config);
+            let loaded = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, CREATED_VIEW),
+                TopicRuntimeOptions::default(),
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+            )
+            .await
+            .unwrap();
+            assert!(loaded.is_none());
+            assert!(partitions.is_tombstoned(&namespace));
+            let (_, recovered) = open_partition_superblock(&directory, test_identity(), 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                recovered,
+                Some(state),
+                "refusal must preserve contradictory durable state"
+            );
+            assert!(!Path::new(&format!("{directory}.fenced.0")).exists());
+            assert!(matches!(
+                build_partition_fresh(
+                    &config,
+                    partitions.config(),
+                    namespace,
+                    Arc::new(PartitionStats::default()),
+                    0,
+                    TopicRuntimeOptions::default(),
+                    CLUSTER,
+                    REPLICA,
+                    REPLICAS,
+                    CREATED_VIEW,
+                    Rc::new(IggyMessageBus::new(0)),
+                )
+                .await,
+                Err(ServerError::PartitionViewBelowCreation { .. }),
+            ));
+        }
+    }
+
+    #[compio::test]
+    async fn given_certified_wal_below_creation_view_when_loading_should_refuse_unchanged() {
+        const CREATED_VIEW: u32 = 2;
+        const LOG_VIEW: u32 = 1;
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let directory = config.get_partition_path(1, 1, 0);
+        let wal = Path::new(&directory).join("prepares-0");
+        create_dir_all(&directory).await.unwrap();
+        let mut journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+            .await
+            .unwrap();
+        journal.certify_log_view(LOG_VIEW, 0, 0).await.unwrap();
+        drop(journal);
+        let partitions = solo_partitions(&config);
+        let metadata = Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, CREATED_VIEW);
+        let runtime = TopicRuntimeOptions {
+            durability: iggy_common::Durability::Persisted,
+            preallocate_segments: Some(false),
+            ..Default::default()
+        };
+        let result = load_partition(
+            &config,
+            partitions.config(),
+            namespace,
+            Arc::new(PartitionStats::default()),
+            &metadata,
+            runtime,
+            CLUSTER,
+            REPLICA,
+            REPLICAS,
+            Rc::new(IggyMessageBus::new(0)),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ServerError::PartitionWalViewBelowCreation {
+                dir,
+                log_view: LOG_VIEW,
+                created_view: CREATED_VIEW,
+            }) if dir == wal
+        ));
+        let loaded = load_partition_or_fence(
+            &config,
+            namespace,
+            Arc::new(PartitionStats::default()),
+            &metadata,
+            runtime,
+            CLUSTER,
+            REPLICA,
+            REPLICAS,
+            Rc::new(IggyMessageBus::new(0)),
+            &partitions,
+        )
+        .await
+        .unwrap();
+        assert!(loaded.is_none());
+        assert!(partitions.is_tombstoned(&namespace));
+        assert!(!Path::new(&format!("{directory}.fenced.0")).exists());
+        let journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+            .await
+            .unwrap();
+        assert_eq!(journal.certified_log_view(), Some(LOG_VIEW));
+    }
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_creation_floor_when_replaying_certified_wal_should_preserve_history_and_view() {
+        const CREATED_VIEW: u32 = 2;
+        const LOG_VIEW: u32 = 5;
+        const PAYLOAD: &[u8] = b"certified-history";
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let runtime = TopicRuntimeOptions {
+            durability: iggy_common::Durability::Persisted,
+            preallocate_segments: Some(false),
+            ..Default::default()
+        };
+        for durable_view in [None, Some(LOG_VIEW + 1)] {
+            let root = tempfile::tempdir().unwrap();
+            let config = solo_config(&root);
+            let partitions_config = solo_partitions_config(&config);
+            let fresh = build_partition_fresh(
+                &config,
+                &partitions_config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                0,
+                runtime,
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                CREATED_VIEW,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap();
+            assert!(!fresh.requires_state_transfer());
+            assert_eq!(fresh.consensus().log_view(), CREATED_VIEW);
+            drop(fresh);
+            let directory = config.get_partition_path(1, 1, 0);
+            let mut messages = IggyMessages::with_capacity(1);
+            messages.push(IggyMessage {
+                header: IggyMessageHeader::default(),
+                payload: Bytes::from_static(PAYLOAD),
+                user_headers: None,
+            });
+            let batch = SendMessagesOwned::from_messages(namespace, &messages).unwrap();
+            let total = size_of::<PrepareHeader>() + batch.header.total_size();
+            let mut prepare = Message::<PrepareHeader>::new(total);
+            let body = &mut prepare.as_mut_slice()[size_of::<PrepareHeader>()..];
+            batch.header.encode_into(body);
+            body[BATCH_HEADER_SIZE..].copy_from_slice(&batch.blob);
+            let prepare = prepare.transmute_header(|_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::SendMessages;
+                header.cluster = CLUSTER;
+                header.group = namespace.inner();
+                header.view = LOG_VIEW;
+                header.op = 1;
+                header.commit = 1;
+                header.size = u32::try_from(total).unwrap();
+                header.checksum = header.identity_checksum();
+            });
+            let checksum = prepare.header().checksum;
+            let wal = Path::new(&directory).join("prepares-0");
+            let mut journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+                .await
+                .unwrap();
+            journal.append(prepare.into_frozen()).await.unwrap();
+            journal
+                .certify_log_view(LOG_VIEW, 1, checksum)
+                .await
+                .unwrap();
+            drop(journal);
+            if let Some(view) = durable_view {
+                let (store, _) =
+                    open_partition_superblock(&directory, test_identity(), CREATED_VIEW)
+                        .await
+                        .unwrap();
+                let state = VsrState {
+                    commit_max: 1,
+                    ..recorded_state(view, LOG_VIEW)
+                };
+                store.write(&state.to_bytes()).await.unwrap();
+            }
+            let recovered = load_partition(
+                &config,
+                &partitions_config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, CREATED_VIEW),
+                runtime,
+                CLUSTER,
+                REPLICA,
+                REPLICAS,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                recovered.consensus().view(),
+                durable_view.unwrap_or(LOG_VIEW)
+            );
+            assert_eq!(recovered.consensus().log_view(), LOG_VIEW);
+            assert_eq!(recovered.consensus().sequencer().current_sequence(), 1);
+            assert_eq!(recovered.consensus().commit_max(), 1);
+            assert!(!recovered.requires_state_transfer());
+            let stored = recovered.log.journal().inner.repair_entry(1).unwrap();
+            assert!(
+                stored
+                    .as_slice()
+                    .windows(PAYLOAD.len())
+                    .any(|bytes| bytes == PAYLOAD)
+            );
+            drop(recovered);
+            let journal = journal::PartitionPrepareJournal::open(&wal, namespace.inner(), 0)
+                .await
+                .unwrap();
+            assert_eq!(journal.certified_log_view(), Some(LOG_VIEW));
+            assert_eq!(journal.head(), 1);
+        }
+    }
 
     #[compio::test]
     async fn loading_after_retention_preserves_the_wal_owned_tail_when_the_logical_chain_is_empty()
@@ -1146,7 +1514,7 @@ mod tests {
             .unwrap(),
         );
         let directory = config.get_partition_path(1, 1, 0);
-        let (store, _) = open_partition_superblock(&directory, test_identity())
+        let (store, _) = open_partition_superblock(&directory, test_identity(), 0)
             .await
             .unwrap();
         let state = recorded_state(3, 2);
@@ -1182,7 +1550,7 @@ mod tests {
             .unwrap();
             assert!(partition.requires_state_transfer());
             assert!(partition.consensus().view() >= state.view);
-            let (_, recovered) = open_partition_superblock(&directory, test_identity())
+            let (_, recovered) = open_partition_superblock(&directory, test_identity(), 0)
                 .await
                 .unwrap();
             assert_eq!(recovered, Some(state));
@@ -1292,7 +1660,7 @@ mod tests {
     /// The reservation the partition left on disk, which is the only copy a
     /// restart or a first send can read.
     async fn recorded_reservation(dir: &str) -> u64 {
-        let (_store, recorded) = open_partition_superblock(dir, solo_identity())
+        let (_store, recorded) = open_partition_superblock(dir, solo_identity(), 0)
             .await
             .expect("reopen the partition superblock");
         recorded
@@ -1335,7 +1703,7 @@ mod tests {
         let config = solo_config(&root);
         let dir = config.get_partition_path(1, 1, 0);
 
-        let (store, recovered) = open_partition_superblock(&dir, solo_identity())
+        let (store, recovered) = open_partition_superblock(&dir, solo_identity(), 0)
             .await
             .expect("open a fresh partition superblock");
         assert!(recovered.is_none());
@@ -1455,9 +1823,10 @@ mod tests {
         // A not-yet-materialized directory must open as fresh, not error: the
         // helper creates it, since a follower can reach load before its first
         // segment write.
-        let (_store, recovered) = open_partition_superblock(&partition_dir(&root), test_identity())
-            .await
-            .expect("open a fresh partition superblock");
+        let (_store, recovered) =
+            open_partition_superblock(&partition_dir(&root), test_identity(), 0)
+                .await
+                .expect("open a fresh partition superblock");
         assert!(
             recovered.is_none(),
             "an empty superblock is a fresh group, never an error"
@@ -1466,35 +1835,37 @@ mod tests {
 
     #[compio::test]
     async fn given_recorded_view_when_superblock_reopened_should_recover_state() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let dir = partition_dir(&root);
-        let (store, recovered) = open_partition_superblock(&dir, test_identity())
-            .await
-            .expect("first open");
-        assert!(recovered.is_none());
-        let state = recorded_state(3, 2);
-        store
-            .write(&state.to_bytes())
-            .await
-            .expect("record the advanced view");
-        drop(store);
+        for (view, log_view, created_view) in [(3, 2, 2), (2, 0, 2), (0, 0, 0)] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = partition_dir(&root);
+            let (store, recovered) = open_partition_superblock(&dir, test_identity(), created_view)
+                .await
+                .expect("first open");
+            assert!(recovered.is_none());
+            let state = recorded_state(view, log_view);
+            store
+                .write(&state.to_bytes())
+                .await
+                .expect("record the advanced view");
+            drop(store);
 
-        let (_store, recovered) = open_partition_superblock(&dir, test_identity())
-            .await
-            .expect("reopen after a restart");
-
-        assert_eq!(
-            recovered,
-            Some(state),
-            "a restarted partition must recover exactly the state it recorded"
-        );
+            let (_store, recovered) =
+                open_partition_superblock(&dir, test_identity(), created_view)
+                    .await
+                    .expect("reopen after a restart");
+            assert_eq!(
+                recovered,
+                Some(state),
+                "a restarted partition must recover exactly its recorded state"
+            );
+        }
     }
 
     #[compio::test]
     async fn given_foreign_cluster_record_when_superblock_opened_should_refuse_boot() {
         let root = tempfile::tempdir().expect("tempdir");
         let dir = partition_dir(&root);
-        let (store, _) = open_partition_superblock(&dir, test_identity())
+        let (store, _) = open_partition_superblock(&dir, test_identity(), 0)
             .await
             .expect("first open");
         let foreign = VsrState {
@@ -1507,7 +1878,7 @@ mod tests {
             .expect("record a foreign identity");
         drop(store);
 
-        let refused = open_partition_superblock(&dir, test_identity()).await;
+        let refused = open_partition_superblock(&dir, test_identity(), 0).await;
 
         match refused {
             Err(ServerError::PartitionSuperblockIdentityMismatch { field, .. }) => {

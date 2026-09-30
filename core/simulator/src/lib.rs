@@ -1690,10 +1690,10 @@ mod tests {
     use crate::client::SimClient;
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
-    use consensus::Status;
+    use consensus::{Status, client_table::COMMITTED_WINDOW_BITS};
     use futures::FutureExt;
     use iggy_binary_protocol::{AckLevel, RoutedRequestHeader, WireIdentifier};
-    use iggy_common::ConsumerKind;
+    use iggy_common::{ConsumerKind, IggyError};
     use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT};
 
     const DISCONNECT_STREAM: &str = "sim-stream-0";
@@ -3234,6 +3234,191 @@ mod tests {
             schedule_a, schedule_b,
             "shell schedule diverged at same seed"
         );
+    }
+
+    #[test]
+    fn given_aged_out_request_when_replayed_should_report_unknown_outcome() {
+        const CLIENT_ID: u128 = 1;
+        for initially_committed in [false, true] {
+            let mut sim = partition_safety_cluster(&[CLIENT_ID]);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.init_partition(namespace);
+            let client = SimClient::new(CLIENT_ID);
+            sim.register_client_with_primary(&client);
+
+            let delayed = client.send_messages(namespace, &[Bytes::from_static(b"aged-out")]);
+            let destination = u8::from(!initially_committed);
+            let first =
+                submit_and_wait_for_reply(&mut sim, CLIENT_ID, destination, delayed.deep_copy());
+            assert_eq!(
+                first.header().status,
+                if initially_committed {
+                    0
+                } else {
+                    IggyError::TransientNotAccepted.as_code()
+                },
+                "the original attempt must establish the intended admission outcome",
+            );
+            for _ in 0..COMMITTED_WINDOW_BITS {
+                let later =
+                    client.send_messages(namespace, &[Bytes::from_static(b"committed-later")]);
+                let committed = submit_and_wait_for_reply(&mut sim, CLIENT_ID, 0, later);
+                assert_eq!(committed.header().status, 0);
+            }
+
+            let expected = sim
+                .offsets(0, namespace)
+                .expect("committed partition offsets");
+            let replay = submit_and_wait_for_reply(&mut sim, CLIENT_ID, 0, delayed);
+            assert_eq!(
+                replay.header().status,
+                IggyError::RequestTooOld.as_code(),
+                "aging out cannot prove whether request 1 committed",
+            );
+            assert_eq!(
+                sim.offsets(0, namespace),
+                Some(expected),
+                "rejecting an aged-out request must not append another payload",
+            );
+        }
+    }
+
+    #[test]
+    fn given_reordered_requests_within_dedup_window_when_retried_should_commit_once() {
+        const CLIENT_ID: u128 = 1;
+        let mut sim = partition_safety_cluster(&[CLIENT_ID]);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        let client = SimClient::new(CLIENT_ID);
+        sim.register_client_with_primary(&client);
+        let delayed = client.send_messages(namespace, &[Bytes::from_static(b"delayed")]);
+        let later = client.send_messages(namespace, &[Bytes::from_static(b"later")]);
+        let committed = submit_and_wait_for_reply(&mut sim, CLIENT_ID, 0, later.deep_copy());
+        assert_eq!(committed.header().status, 0);
+        let committed = submit_and_wait_for_reply(&mut sim, CLIENT_ID, 0, delayed.deep_copy());
+        assert_eq!(committed.header().status, 0);
+        let expected = sim.offsets(0, namespace).unwrap();
+        assert_eq!(
+            expected.commit_offset, 1,
+            "both reordered requests must append"
+        );
+        for replay in [delayed, later] {
+            let duplicate = submit_and_wait_for_reply(&mut sim, CLIENT_ID, 0, replay);
+            assert_eq!(duplicate.header().status, 0);
+            assert_eq!(
+                sim.offsets(0, namespace),
+                Some(expected),
+                "a retained duplicate must not append again"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_unpersisted_creation_view_when_replicas_restart_should_preserve_acknowledged_writes() {
+        const CLIENT_ID: u128 = 1;
+        const PROGRESS_STEPS: usize = 2_000;
+        const PAYLOAD: &[u8] = b"acknowledged-before-late-materialization";
+        for created_view in [1, 2] {
+            let mut sim = partition_safety_cluster(&[CLIENT_ID]);
+            let client = SimClient::new(CLIENT_ID);
+            sim.register_client_with_primary(&client);
+            let namespace = IggyNamespace::new(1, 1, 0);
+            sim.partition_created_views.insert(namespace, created_view);
+            sim.seed_stream_topic_partition(namespace);
+            for replica in &sim.replicas[..2] {
+                materialise_partition(
+                    replica,
+                    namespace,
+                    false,
+                    created_view,
+                    sim.consumer_offsets_max,
+                );
+                assert!(
+                    replica.partition_superblocks.borrow()[&namespace]
+                        .read_latest_sync()
+                        .is_none(),
+                    "the crash must precede the first durable view write"
+                );
+            }
+            for replica in 0..2 {
+                sim.replica_crash(replica);
+            }
+            for replica in 0..2 {
+                sim.replica_restart(replica);
+            }
+            let primary = (0..PROGRESS_STEPS)
+                .find_map(|_| {
+                    sim.step();
+                    (0..2).find(|replica| {
+                        sim.partition_consensus_state(usize::from(*replica), namespace)
+                            .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                    })
+                })
+                .expect("the restarted quorum must elect a primary");
+            let request = client.send_messages(namespace, &[Bytes::from_static(PAYLOAD)]);
+            let committed = submit_and_wait_for_reply(&mut sim, CLIENT_ID, primary, request);
+            assert_eq!(committed.header().status, 0);
+            let committed_op = committed.header().commit;
+            let expected = sim
+                .offsets(usize::from(primary), namespace)
+                .expect("acknowledged partition offsets");
+
+            materialise_partition(
+                &sim.replicas[2],
+                namespace,
+                false,
+                created_view,
+                sim.consumer_offsets_max,
+            );
+            assert!(
+                (0..PROGRESS_STEPS).any(|_| {
+                    sim.step();
+                    (0..3).all(|replica| {
+                        sim.partition_consensus_state(replica, namespace)
+                            .is_some_and(|state| {
+                                state.status == Status::Normal && state.commit_min >= committed_op
+                            })
+                            && sim.offsets(replica, namespace) == Some(expected)
+                    })
+                }),
+                "late materialization must preserve the acknowledged prefix: states={:?}, offsets={:?}",
+                (0..3)
+                    .map(|replica| sim.partition_consensus_state(replica, namespace))
+                    .collect::<Vec<_>>(),
+                (0..3)
+                    .map(|replica| sim.offsets(replica, namespace))
+                    .collect::<Vec<_>>()
+            );
+            for replica in 0..3 {
+                let prepare = retained_prepare(&sim, replica, namespace, committed_op);
+                assert!(
+                    prepare
+                        .body()
+                        .windows(PAYLOAD.len())
+                        .any(|bytes| bytes == PAYLOAD),
+                    "replica {replica} lost the acknowledged payload at op {committed_op}"
+                );
+            }
+        }
+    }
+
+    fn partition_safety_cluster(client_ids: &[u128]) -> Simulator {
+        const REPLICA_COUNT: u8 = 3;
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        Simulator::new(
+            usize::from(REPLICA_COUNT),
+            client_ids.iter().copied(),
+            packet::PacketSimulatorOptions {
+                node_count: REPLICA_COUNT,
+                client_count: u8::try_from(client_ids.len()).expect("test clients fit u8"),
+                ..packet::PacketSimulatorOptions::default()
+            },
+        )
     }
 
     fn successful_send_reply_count(replies: &[Message<ReplyHeader>]) -> usize {

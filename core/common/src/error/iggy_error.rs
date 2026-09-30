@@ -173,6 +173,10 @@ pub enum IggyError {
     InvalidBooleanValue = 83,
     #[error("Invalid number value")]
     InvalidNumberValue = 84,
+    #[error(
+        "Request is below the deduplication window; outcome unknown, resending may duplicate the write"
+    )]
+    RequestTooOld = 85,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -646,5 +650,20 @@ mod tests {
         assert_eq!(error.as_code(), 3024);
         assert_eq!(IggyError::from_code(3024), error);
         assert_eq!(IggyError::from_code_as_string(3024), error.as_string());
+    }
+
+    #[test]
+    fn aged_out_request_code_does_not_reuse_retired_encryption_error() {
+        const REQUEST_TOO_OLD_CODE: u32 = 85;
+        const RETIRED_ENCRYPTION_KEY_CODE: u32 = 60;
+        assert_eq!(IggyError::RequestTooOld.as_code(), REQUEST_TOO_OLD_CODE);
+        assert_eq!(
+            IggyError::from_code(REQUEST_TOO_OLD_CODE),
+            IggyError::RequestTooOld,
+        );
+        assert_eq!(
+            IggyError::from_code(RETIRED_ENCRYPTION_KEY_CODE),
+            IggyError::Error,
+        );
     }
 }

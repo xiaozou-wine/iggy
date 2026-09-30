@@ -207,6 +207,25 @@ pub enum ServerError {
         expected: u128,
         found: u128,
     },
+    #[error(
+        "partition superblock at {dir} falls below committed creation view {created_view}: \
+         view {view}, log_view {log_view}"
+    )]
+    PartitionViewBelowCreation {
+        dir: PathBuf,
+        view: u32,
+        log_view: u32,
+        created_view: u32,
+    },
+    #[error(
+        "partition WAL certificate at {dir} falls below committed creation view {created_view}: \
+         log_view {log_view}"
+    )]
+    PartitionWalViewBelowCreation {
+        dir: PathBuf,
+        log_view: u32,
+        created_view: u32,
+    },
     // Only the `Refused` shape is per-partition: the loader's fence-or-tombstone
     // arm catches it. Everything else the partition readers raise fails the
     // boot, and the reconciler logs it and retries the partition with backoff.

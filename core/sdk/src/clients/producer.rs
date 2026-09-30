@@ -61,22 +61,13 @@ pub(crate) fn no_confirmations() -> SendMessagesResponse {
     }
 }
 
-/// True when `error` can only have been raised after the server committed the
-/// batch. Resending then turns one committed write into as many copies as the
-/// retry budget allows, on a plane that keeps no reply cache to collapse them.
-///
-/// Both kinds are raised while decoding the HTTP reply body, which is reached
-/// only once the status check has accepted a 2xx, so the batch landed and just
-/// its confirmation is unreadable. The binary path degrades an unreadable body
-/// to an empty confirmation list and never raises either kind.
-///
-/// Membership is scoped to the send path and must stay conservative. An error
-/// meaning the request never arrived, or that the server rejected it before
-/// committing, has to keep retrying.
-fn implies_committed_send(error: &IggyError) -> bool {
+/// Stop for HTTP confirmation decode failures after a successful status, or
+/// an explicit refusal of an aged-out dedup ID whose outcome is unknown.
+/// Other failures retain the producer's at-least-once retry policy.
+const fn stops_send_retries(error: &IggyError) -> bool {
     matches!(
         error,
-        IggyError::InvalidBytesResponse | IggyError::InvalidJsonResponse
+        IggyError::InvalidBytesResponse | IggyError::InvalidJsonResponse | IggyError::RequestTooOld
     )
 }
 
@@ -294,10 +285,14 @@ impl ProducerCore {
                 // failed attempts have none to report.
                 Ok(confirmation) => return Ok(confirmation),
                 Err(error) => {
-                    if implies_committed_send(&error) {
+                    if stops_send_retries(&error) {
+                        let reason = if matches!(error, IggyError::RequestTooOld) {
+                            "outcome unknown, deduplication evidence expired"
+                        } else {
+                            "batch committed, confirmation unreadable"
+                        };
                         error!(
-                            "Not retrying a send to topic: {topic}, stream: {stream}: the batch \
-                             committed and only its confirmation could not be read. {error}."
+                            "Not retrying a send to topic: {topic}, stream: {stream}: {reason}. {error}."
                         );
                         return Err(error);
                     }
@@ -671,8 +666,8 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// # Retrying and what a failure means
 ///
-/// A retry is the same request sent again unchanged, meaning a producer never rewrites, splits, or
-/// reorders a batch to retry a send. [`send_retries()`] sets how many times it may try and how
+/// A producer retry sends the same batch under a new request ID without rewriting, splitting, or
+/// reordering it. [`send_retries()`] sets how many times it may try and how
 /// later retries are paced. The default allows three retries and configures a one-second interval.
 /// The first retry is immediate. Later retries wait for the next tick of an interval timer, so they
 /// are at most one interval apart, and an attempt that outlasts the interval is followed by the next
@@ -682,15 +677,20 @@ unsafe impl Sync for IggyProducer {}
 /// A request can fail after the server has already appended it, so the first request of an
 /// unconfirmed tail may already be in the partition. Sending the tail again can therefore write the
 /// same messages twice, leaving the batch in the partition at multiple offsets. A consumer that
-/// cannot accept duplicates must recognize them itself.
+/// cannot accept duplicates must recognize them itself. This at-least-once policy also retries
+/// ambiguous failures such as [`IggyError::Disconnected`] and [`IggyError::TransientNotCommitted`].
+/// The explicit aged-out refusal and HTTP confirmation decode failures below stop retries.
+/// [`IggyError::RequestTooOld`] confirms that the server's deduplication evidence has expired.
+/// The producer returns the unconfirmed batch so the caller can decide whether to risk resending it.
 ///
 /// What is retried, and what is not:
 ///
 /// | Situation | Retried | What the caller ends up with |
 /// | --- | --- | --- |
 /// | the client is not signed in, so nothing may be sent yet | yes | the send goes ahead as soon as the client is signed in, or fails with [`IggyError::CannotSendMessagesDueToClientDisconnection`] once the retry budget is spent |
-/// | the request failed without an indication that it committed | yes, the identical request is sent again | the confirmation of the attempt that finally succeeds, or the last error once the retry budget is spent |
+/// | the request failed with another error | yes, the messages are sent as a new request | the confirmation of the attempt that finally succeeds, or the last error once the retry budget is spent |
 /// | the batch committed, but its confirmation could not be read ([`IggyError::InvalidBytesResponse`] or [`IggyError::InvalidJsonResponse`], raised on the HTTP transport only) | no | the write did happen and retrying would duplicate it on purpose |
+/// | the request aged out of the dedup window ([`IggyError::RequestTooOld`]) | no | its outcome is unknown and another request could duplicate it |
 /// | encrypting or partitioning the batch failed | no | that cause, with the whole batch returned as unconfirmed because nothing was sent, although earlier messages may already have been encrypted in place |
 /// | [`send_retries()`] passed `None` or `0` | no | the outcome of the single attempt, which skips the sign-in check above and fails with the transport error when the client is disconnected |
 ///
@@ -1057,19 +1057,34 @@ impl IggyProducer {
 
 #[cfg(test)]
 mod tests {
-    use super::implies_committed_send;
-    use iggy_common::IggyError;
+    use super::stops_send_retries;
+    use crate::client_wrappers::client_wrapper::ClientWrapper;
+    use crate::clients::producer_builder::IggyProducerBuilder;
+    use crate::clients::producer_config::DirectConfig;
+    use crate::tcp::tcp_client::TcpClient;
+    use bytes::Bytes;
+    use iggy_binary_protocol::{Command, HEADER_SIZE, Operation, ReplyHeader, RequestHeader};
+    use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
+    use iggy_common::{
+        BinaryTransport, Client, ClientState, Identifier, IggyError, IggyMessage, Partitioning,
+        TcpClientConfig, VsrSessionControl,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_unreadable_confirmation_of_a_committed_batch_stops_retrying() {
-        assert!(implies_committed_send(&IggyError::InvalidBytesResponse));
-        assert!(implies_committed_send(&IggyError::InvalidJsonResponse));
+        assert!(stops_send_retries(&IggyError::InvalidBytesResponse));
+        assert!(stops_send_retries(&IggyError::InvalidJsonResponse));
     }
 
     #[test]
-    fn test_errors_reachable_before_a_commit_keep_retrying() {
+    fn test_other_failures_keep_the_at_least_once_retry_policy() {
         for error in [
             IggyError::Disconnected,
+            IggyError::TransientNotCommitted,
             IggyError::EmptyResponse,
             IggyError::Unauthenticated,
             IggyError::Unauthorized,
@@ -1078,9 +1093,85 @@ mod tests {
             IggyError::ResourceNotFound(String::new()),
         ] {
             assert!(
-                !implies_committed_send(&error),
-                "{error} does not prove a commit, so it must stay retryable"
+                !stops_send_retries(&error),
+                "{error} remains retryable under the producer's at-least-once policy"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn aged_out_request_stops_producer_retries_without_minting_another_request() {
+        const RETRIES: u32 = 2;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut requests = Vec::new();
+            let mut header_bytes = [0u8; HEADER_SIZE];
+            while stream.read_exact(&mut header_bytes).await.is_ok() {
+                let request =
+                    bytemuck::checked::try_pod_read_unaligned::<RequestHeader>(&header_bytes)
+                        .unwrap();
+                assert_eq!(request.operation, Operation::SendMessages);
+                let mut body = vec![0u8; usize::try_from(request.size).unwrap() - HEADER_SIZE];
+                stream.read_exact(&mut body).await.unwrap();
+                requests.push(request.request);
+                let reply = ReplyHeader {
+                    command: Command::Reply,
+                    operation: request.operation,
+                    client: request.client,
+                    request: request.request,
+                    size: u32::try_from(HEADER_SIZE).unwrap(),
+                    status: IggyError::RequestTooOld.as_code(),
+                    ..Default::default()
+                };
+                stream.write_all(bytemuck::bytes_of(&reply)).await.unwrap();
+            }
+            requests
+        });
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: address,
+            ..Default::default()
+        }))
+        .unwrap();
+        Client::connect(&client).await.unwrap();
+        client.bind_vsr_session(1).await.unwrap();
+        client.set_state(ClientState::Authenticated).await;
+        let producer = IggyProducerBuilder::new(
+            IggyRwLock::new(ClientWrapper::Tcp(client)),
+            Identifier::numeric(1).unwrap(),
+            "stream".to_owned(),
+            Identifier::numeric(1).unwrap(),
+            "topic".to_owned(),
+            None,
+            None,
+        )
+        .partitioning(Partitioning::partition_id(0))
+        .direct(DirectConfig::builder().build())
+        .send_retries(Some(RETRIES), None)
+        .build();
+        let message = IggyMessage::builder()
+            .payload(Bytes::from_static(b"unknown-outcome"))
+            .build()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), producer.send(vec![message]))
+            .await
+            .unwrap();
+        let Err(IggyError::ProducerSendFailed { cause, failed, .. }) = result else {
+            panic!("the producer must return an unconfirmed batch");
+        };
+        assert!(
+            matches!(*cause, IggyError::RequestTooOld),
+            "unexpected producer error: {cause:?}"
+        );
+        assert_eq!(failed.len(), 1);
+        Client::shutdown(&*producer.core.client.read().await)
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.await.unwrap().len(),
+            1,
+            "unknown outcome must not mint a fresh request"
+        );
     }
 }

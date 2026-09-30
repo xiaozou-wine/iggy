@@ -4359,15 +4359,23 @@ where
             .as_ref()
             .map(|state| (state.view, state.log_view));
         let restarted = retained.is_some() && self.partition_consensus.replica_count > 1;
-        let consensus::FreshGroupStart { join, seed_view } =
-            consensus::fresh_group_start(restarted, durable_view, created_view);
+        let consensus::FreshGroupStart {
+            join,
+            view_fallback,
+            seed_view,
+        } = consensus::fresh_group_start(restarted, durable_view, created_view);
 
         // Recorded view first, exactly as the two boot paths order it: restoring
         // after `init` would advertise a view older than the recorded one.
         if let Some((view, log_view)) = durable_view {
-            consensus.set_view(view);
+            consensus.set_view(match view_fallback {
+                Some(floor) if log_view == 0 => view.max(floor),
+                _ => view,
+            });
             consensus.set_log_view(log_view);
             consensus.mark_superblock_durable(view, log_view);
+        } else if let Some(view) = view_fallback {
+            consensus.set_view(view);
         } else if let Some(view) = seed_view {
             consensus.set_view(view);
             consensus.set_log_view(view);

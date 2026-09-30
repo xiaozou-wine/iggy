@@ -49,6 +49,40 @@ Older SDKs can lose membership when a backup refuses an offset commit,
 and new SDKs require servers supporting those commands. HTTP polling is
 forwarded by the server and keeps its existing client API.
 
+## Upgrade recovery
+
+Partition recovery refuses a superblock whose nonzero `log_view`
+is below the partition's committed `created_view`. It also refuses a WAL
+certificate with a nonzero `log_view` below that floor. The log names the
+superblock directory or the `prepares-{revision}` WAL directory and the
+recorded views. The affected partition is tombstoned locally and is not served;
+its durable files are preserved.
+
+For a superblock with `log_view` zero, recovery raises `view` to at least
+`created_view` without changing `log_view`. The raised view must be persisted
+before any view-scoped send, just as when no superblock record exists.
+
+Such state can have been written by older servers, including `server-0.9.0`,
+after restarting before the partition's first superblock write. The creation
+view was not restored on that path. Raising a nonzero `log_view` during an
+upgrade would certify history that the replica may not hold, so the server
+does not repair those records automatically.
+
+If recovery logs `falls below committed creation view` for a partition
+superblock or WAL certificate:
+
+1. Pause writes to the affected partition and stop the affected cluster before
+   changing any recovery files. Keep the refusal logs.
+2. Preserve a consistent copy of every replica's metadata, partition
+   superblocks, WAL directories and segment files together with its configuration.
+3. Restore only from a verified consistent backup, or use a separately validated
+   recovery procedure based on retained replica history. Confirm that it preserves
+   acknowledged writes and agrees with the committed partition creation metadata.
+
+There is no automatic in-place migration for below-floor log certificates. Do not edit
+view numbers or delete superblocks or WAL directories to bypass the refusal:
+an empty history could then replace committed data during a view change.
+
 ## Systemd integration
 
 Build with the `systemd` feature to enable readiness and watchdog notifications:
